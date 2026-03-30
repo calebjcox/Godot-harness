@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Godot (when testing locally inside this repo)
+.godot/
+*.uid
+
+# Editor
+.idea/
+.vscode/
+*.swp

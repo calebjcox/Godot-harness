@@ -1,0 +1,410 @@
+## ClaudeHarness — main autoload singleton.
+## Starts the HTTP server and handles all incoming requests.
+## process_mode = ALWAYS so the server keeps running while the game is paused.
+extends Node
+
+const DEFAULT_PORT := 9080
+const SNAP_DEPTH := 8
+
+var _server: Node       # HTTPServer instance
+var _baseline: Dictionary = {}
+var _baseline_set := false
+var _paused := false    # tracks OUR pause state (may differ from get_tree().paused if
+                         # another system pauses the tree)
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+
+func _ready() -> void:
+	process_mode = Node.PROCESS_MODE_ALWAYS
+	name = "ClaudeHarness"
+
+	var port: int = ProjectSettings.get_setting("claude_harness/port", DEFAULT_PORT)
+
+	_server = load("res://addons/claude_harness/autoload/http_server.gd").new()
+	_server.process_mode = Node.PROCESS_MODE_ALWAYS
+	_server.name = "ClaudeHarnessHTTP"
+	add_child(_server)
+
+	_server.request_received.connect(_on_request)
+
+	if _server.start(port):
+		print("ClaudeHarness: Listening on http://127.0.0.1:%d" % port)
+	else:
+		push_error("ClaudeHarness: Could not start HTTP server on port %d" % port)
+
+# ---------------------------------------------------------------------------
+# Request router
+# ---------------------------------------------------------------------------
+
+func _on_request(conn: StreamPeerTCP, method: String, path: String,
+		params: Dictionary, body: String) -> void:
+	match path:
+		"/status":
+			_h_status(conn)
+		"/pause":
+			_h_pause(conn)
+		"/resume":
+			_h_resume(conn)
+		"/baseline":
+			_h_set_baseline(conn)
+		"/diff":
+			_h_diff(conn)
+		"/snapshot":
+			_h_snapshot(conn)
+		"/observe":
+			_h_observe(conn, params)
+		"/step":
+			_h_step(conn, params)
+		"/wait":
+			_h_wait(conn, body)
+		"/input":
+			_h_input(conn, body)
+		"/frame":
+			_h_frame(conn, params)
+		_:
+			HTTPServer.send_json(conn, {"error": "Unknown path: " + path}, 404)
+
+# ---------------------------------------------------------------------------
+# Sync handlers
+# ---------------------------------------------------------------------------
+
+func _h_status(conn: StreamPeerTCP) -> void:
+	HTTPServer.send_json(conn, {
+		"ok": true,
+		"godot_version": Engine.get_version_info().get("string", "4.x"),
+		"fps": Engine.get_frames_per_second(),
+		"scene_name": _current_scene_name(),
+		"paused": _paused,
+		"baseline_set": _baseline_set,
+	})
+
+func _h_pause(conn: StreamPeerTCP) -> void:
+	get_tree().paused = true
+	_paused = true
+	HTTPServer.send_json(conn, {"ok": true, "paused": true})
+
+func _h_resume(conn: StreamPeerTCP) -> void:
+	get_tree().paused = false
+	_paused = false
+	HTTPServer.send_json(conn, {"ok": true, "paused": false})
+
+func _h_set_baseline(conn: StreamPeerTCP) -> void:
+	_baseline = SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	_baseline_set = true
+	HTTPServer.send_json(conn, {
+		"ok": true,
+		"node_count": _baseline.size(),
+		"baseline_timestamp": Time.get_ticks_msec(),
+	})
+
+func _h_diff(conn: StreamPeerTCP) -> void:
+	if not _baseline_set:
+		HTTPServer.send_json(conn,
+			{"error": "No baseline set. Call POST /baseline first."}, 400)
+		return
+	var current := SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	var diff := SceneInspector.compute_diff(_baseline, current)
+	diff["t_ms"] = Time.get_ticks_msec()
+	HTTPServer.send_json(conn, diff)
+
+func _h_snapshot(conn: StreamPeerTCP) -> void:
+	var snap := SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	_baseline = snap
+	_baseline_set = true
+	HTTPServer.send_json(conn, {
+		"ok": true,
+		"node_count": snap.size(),
+		"snapshot": snap,
+	})
+
+# ---------------------------------------------------------------------------
+# Async handlers — fire-and-forget coroutines
+# ---------------------------------------------------------------------------
+
+func _h_observe(conn: StreamPeerTCP, params: Dictionary) -> void:
+	var snapshots := int(params.get("snapshots", "10"))
+	var interval_ms := int(params.get("interval_ms", "100"))
+	_observe_async(conn, snapshots, interval_ms)
+
+func _observe_async(conn: StreamPeerTCP, snapshots: int, interval_ms: int) -> void:
+	# Auto-set baseline on first observe if none exists
+	if not _baseline_set:
+		_baseline = SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+		_baseline_set = true
+
+	var results: Array = []
+	var frames_per_interval := max(1, roundi(interval_ms / (1000.0 / 60.0)))
+
+	for i in range(snapshots):
+		if i > 0:
+			if _paused:
+				# Auto-step frames between snapshots when game is paused
+				await _advance_frames(frames_per_interval)
+			else:
+				await get_tree().create_timer(interval_ms / 1000.0).timeout
+
+		var current := SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+		var diff := SceneInspector.compute_diff(_baseline, current)
+		diff["t_ms"] = Time.get_ticks_msec()
+		if i == 0 and _paused:
+			diff["note"] = "game_paused_stepping_frames"
+		results.append(diff)
+
+	HTTPServer.send_json(conn, results)
+
+# ----------
+
+func _h_step(conn: StreamPeerTCP, params: Dictionary) -> void:
+	var frames := int(params.get("frames", "1"))
+	_step_async(conn, frames)
+
+func _step_async(conn: StreamPeerTCP, frames: int) -> void:
+	var start_ms := Time.get_ticks_msec()
+	var was_paused := _paused
+	get_tree().paused = false
+	await _advance_frames(frames)
+	get_tree().paused = true
+	_paused = true
+	HTTPServer.send_json(conn, {
+		"ok": true,
+		"frames_stepped": frames,
+		"elapsed_ms": Time.get_ticks_msec() - start_ms,
+		"was_paused_before": was_paused,
+	})
+
+# ----------
+
+func _h_wait(conn: StreamPeerTCP, body: String) -> void:
+	var parsed := JSON.new()
+	if parsed.parse(body) != OK:
+		HTTPServer.send_json(conn, {"error": "Invalid JSON body"}, 400)
+		return
+	_wait_async(conn, parsed.data)
+
+func _wait_async(conn: StreamPeerTCP, data: Dictionary) -> void:
+	var node_path: String = data.get("node_path", "")
+	var property: String = data.get("property", "")
+	var op: String = data.get("op", "changed")
+	var target_value = data.get("value", null)
+	var timeout_ms: int = int(data.get("timeout_ms", 5000))
+
+	if node_path.is_empty() or property.is_empty():
+		HTTPServer.send_json(conn,
+			{"error": "node_path and property are required"}, 400)
+		return
+
+	var was_paused := _paused
+	if _paused:
+		get_tree().paused = false
+		_paused = false
+
+	var start_ms := Time.get_ticks_msec()
+	var last_value = _read_property(node_path, property)
+
+	while Time.get_ticks_msec() - start_ms < timeout_ms:
+		await get_tree().process_frame
+		var current_value = _read_property(node_path, property)
+
+		if current_value == null:
+			# Node or property disappeared
+			_restore_pause(was_paused)
+			HTTPServer.send_json(conn, {
+				"ok": false,
+				"error": "Node or property not found: %s / %s" % [node_path, property],
+				"elapsed_ms": Time.get_ticks_msec() - start_ms,
+			})
+			return
+
+		if _eval_condition(current_value, op, target_value, last_value):
+			_restore_pause(was_paused)
+			var current_snap := SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+			var diff := SceneInspector.compute_diff(_baseline, current_snap)
+			HTTPServer.send_json(conn, {
+				"ok": true,
+				"matched_value": _to_json_value(current_value),
+				"elapsed_ms": Time.get_ticks_msec() - start_ms,
+				"diff_from_baseline": diff,
+			})
+			return
+
+		last_value = current_value
+
+	_restore_pause(was_paused)
+	HTTPServer.send_json(conn, {
+		"ok": false,
+		"timeout": true,
+		"elapsed_ms": timeout_ms,
+	})
+
+# ----------
+
+func _h_input(conn: StreamPeerTCP, body: String) -> void:
+	var parsed := JSON.new()
+	if parsed.parse(body) != OK:
+		HTTPServer.send_json(conn, {"error": "Invalid JSON body"}, 400)
+		return
+	_input_async(conn, parsed.data)
+
+func _input_async(conn: StreamPeerTCP, data: Dictionary) -> void:
+	var action: String = str(data.get("action", ""))
+	var duration_ms: float = float(data.get("duration_ms", 50))
+	var start_ms := Time.get_ticks_msec()
+
+	if action.begins_with("key:"):
+		var key_name := action.substr(4)
+		var keycode := OS.find_keycode_from_string(key_name)
+		if keycode == KEY_NONE:
+			HTTPServer.send_json(conn,
+				{"error": "Unknown key name: " + key_name}, 400)
+			return
+		await _press_key(keycode, duration_ms)
+
+	elif action.begins_with("click:"):
+		var parts := action.substr(6).split(",")
+		if parts.size() != 2:
+			HTTPServer.send_json(conn,
+				{"error": "click format must be click:X,Y"}, 400)
+			return
+		_fire_click(int(parts[0]), int(parts[1]))
+
+	else:
+		# Named InputMap action
+		if not InputMap.has_action(action):
+			HTTPServer.send_json(conn,
+				{"error": "Unknown InputMap action: " + action
+				+ ". Available: " + ", ".join(InputMap.get_actions())}, 400)
+			return
+		Input.action_press(action)
+		await get_tree().create_timer(duration_ms / 1000.0).timeout
+		Input.action_release(action)
+
+	HTTPServer.send_json(conn, {
+		"ok": true,
+		"action": action,
+		"t_ms": Time.get_ticks_msec() - start_ms,
+	})
+
+# ----------
+
+func _h_frame(conn: StreamPeerTCP, params: Dictionary) -> void:
+	_frame_async(conn, params)
+
+func _frame_async(conn: StreamPeerTCP, params: Dictionary) -> void:
+	var scale := float(params.get("scale", "0.5"))
+	var quality := float(params.get("quality", "0.75"))
+
+	# Wait for the next fully-rendered frame before capturing
+	await RenderingServer.frame_post_draw
+
+	var viewport := get_viewport()
+	var img := viewport.get_texture().get_image()
+
+	if scale != 1.0 and scale > 0.0:
+		var new_w := max(1, int(img.get_width() * scale))
+		var new_h := max(1, int(img.get_height() * scale))
+		img.resize(new_w, new_h, Image.INTERPOLATE_BILINEAR)
+
+	var jpg_bytes := img.save_jpg_to_buffer(quality)
+	var b64 := Marshalls.raw_to_base64(jpg_bytes)
+
+	HTTPServer.send_json(conn, {
+		"image": b64,
+		"width": img.get_width(),
+		"height": img.get_height(),
+		"format": "jpeg",
+		"scale": scale,
+		"size_kb": round(jpg_bytes.size() / 1024.0 * 10) / 10.0,
+	})
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+func _current_scene_name() -> String:
+	var root := get_tree().root
+	if root.get_child_count() > 0:
+		return root.get_child(root.get_child_count() - 1).name
+	return ""
+
+func _restore_pause(was_paused: bool) -> void:
+	if was_paused:
+		get_tree().paused = true
+		_paused = true
+	else:
+		get_tree().paused = false
+		_paused = false
+
+func _advance_frames(n: int) -> void:
+	for _i in range(n):
+		await RenderingServer.frame_post_draw
+
+func _read_property(node_path: String, prop_path: String) -> Variant:
+	var node := get_node_or_null(NodePath(node_path))
+	if node == null:
+		return null
+
+	# "prop:subfield" notation for Vector2/Vector3/Color components
+	if ":" in prop_path:
+		var sep := prop_path.find(":")
+		var base := prop_path.left(sep)
+		var sub := prop_path.substr(sep + 1)
+		var base_val = node.get(base)
+		if base_val == null:
+			return null
+		if base_val is Vector2:
+			match sub:
+				"x": return base_val.x
+				"y": return base_val.y
+		elif base_val is Vector3:
+			match sub:
+				"x": return base_val.x
+				"y": return base_val.y
+				"z": return base_val.z
+		elif base_val is Color:
+			match sub:
+				"r": return base_val.r
+				"g": return base_val.g
+				"b": return base_val.b
+				"a": return base_val.a
+		return null
+
+	return node.get(prop_path)
+
+func _eval_condition(current, op: String, target, last) -> bool:
+	match op:
+		"eq":      return current == target
+		"neq":     return current != target
+		"gt":      return current > target
+		"lt":      return current < target
+		"gte":     return current >= target
+		"lte":     return current <= target
+		"changed": return str(current) != str(last)
+	return false
+
+func _to_json_value(v: Variant) -> Variant:
+	if v is Vector2: return {"x": v.x, "y": v.y}
+	if v is Vector3: return {"x": v.x, "y": v.y, "z": v.z}
+	if v is Color:   return {"r": v.r, "g": v.g, "b": v.b, "a": v.a}
+	return v
+
+func _press_key(keycode: Key, duration_ms: float) -> void:
+	var ev := InputEventKey.new()
+	ev.keycode = keycode
+	ev.pressed = true
+	Input.parse_input_event(ev)
+	await get_tree().create_timer(duration_ms / 1000.0).timeout
+	var ev2 := InputEventKey.new()
+	ev2.keycode = keycode
+	ev2.pressed = false
+	Input.parse_input_event(ev2)
+
+func _fire_click(x: int, y: int) -> void:
+	for pressed in [true, false]:
+		var ev := InputEventMouseButton.new()
+		ev.position = Vector2(x, y)
+		ev.global_position = Vector2(x, y)
+		ev.button_index = MOUSE_BUTTON_LEFT
+		ev.pressed = pressed
+		Input.parse_input_event(ev)
