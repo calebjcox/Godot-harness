@@ -49,40 +49,41 @@ claude_harness/port = 9080
 
 ### 2. Python MCP server
 
-```bash
-cd mcp-server
-pip install -e .
-```
+No manual install needed if you use `uv` (recommended). `uv run` handles dependencies automatically on first launch.
+
+If you don't have `uv`: `curl -LsSf https://astral.sh/uv/install.sh | sh`
 
 ### 3. Configure Claude Code
 
-Add to your game project's `.claude/mcp.json` (create it if it doesn't exist):
+Add to your game project's `.claude/mcp.json` (create it if it doesn't exist).
+
+**With uv (recommended — no install step):**
+
+```json
+{
+  "mcpServers": {
+    "godot-harness": {
+      "command": "uv",
+      "args": ["run", "--project", "/path/to/godot-harness/mcp-server", "server.py"]
+    }
+  }
+}
+```
+
+**With pip (manual install required first: `pip install -e mcp-server/`):**
 
 ```json
 {
   "mcpServers": {
     "godot-harness": {
       "command": "python",
-      "args": ["/path/to/godot-harness/mcp-server/server.py"],
-      "env": {
-        "GODOT_HARNESS_URL": "http://localhost:9080"
-      }
+      "args": ["/path/to/godot-harness/mcp-server/server.py"]
     }
   }
 }
 ```
 
-Or use `godot-claude-harness` if installed as a script:
-
-```json
-{
-  "mcpServers": {
-    "godot-harness": {
-      "command": "godot-claude-harness"
-    }
-  }
-}
-```
+Override the default port if needed by adding `"env": {"GODOT_HARNESS_URL": "http://localhost:9080"}` to either config.
 
 ---
 
