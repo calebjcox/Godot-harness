@@ -34,15 +34,15 @@ func _process(_delta: float) -> void:
 
 	# Service existing connections
 	for conn in _connections.duplicate():
-		var status := conn.get_status()
+		var status: int = conn.get_status()
 		if status == StreamPeerTCP.STATUS_NONE or status == StreamPeerTCP.STATUS_ERROR:
 			_drop_connection(conn)
 			continue
 
-		var available := conn.get_available_bytes()
+		var available: int = conn.get_available_bytes()
 		if available > 0:
-			var chunk := conn.get_utf8_string(available)
-			var iid := conn.get_instance_id()
+			var chunk: String = conn.get_utf8_string(available)
+			var iid: int = conn.get_instance_id()
 			_buffers[iid] = _buffers.get(iid, "") + chunk
 			_try_parse(_buffers[iid], conn)
 

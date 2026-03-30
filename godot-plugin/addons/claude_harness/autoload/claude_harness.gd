@@ -3,6 +3,9 @@
 ## process_mode = ALWAYS so the server keeps running while the game is paused.
 extends Node
 
+const _HTTPServer = preload("res://addons/claude_harness/autoload/http_server.gd")
+const _SceneInspector = preload("res://addons/claude_harness/autoload/scene_inspector.gd")
+
 const DEFAULT_PORT := 9080
 const SNAP_DEPTH := 8
 
@@ -64,14 +67,14 @@ func _on_request(conn: StreamPeerTCP, method: String, path: String,
 		"/frame":
 			_h_frame(conn, params)
 		_:
-			HTTPServer.send_json(conn, {"error": "Unknown path: " + path}, 404)
+			_HTTPServer.send_json(conn, {"error": "Unknown path: " + path}, 404)
 
 # ---------------------------------------------------------------------------
 # Sync handlers
 # ---------------------------------------------------------------------------
 
 func _h_status(conn: StreamPeerTCP) -> void:
-	HTTPServer.send_json(conn, {
+	_HTTPServer.send_json(conn, {
 		"ok": true,
 		"godot_version": Engine.get_version_info().get("string", "4.x"),
 		"fps": Engine.get_frames_per_second(),
@@ -83,17 +86,17 @@ func _h_status(conn: StreamPeerTCP) -> void:
 func _h_pause(conn: StreamPeerTCP) -> void:
 	get_tree().paused = true
 	_paused = true
-	HTTPServer.send_json(conn, {"ok": true, "paused": true})
+	_HTTPServer.send_json(conn, {"ok": true, "paused": true})
 
 func _h_resume(conn: StreamPeerTCP) -> void:
 	get_tree().paused = false
 	_paused = false
-	HTTPServer.send_json(conn, {"ok": true, "paused": false})
+	_HTTPServer.send_json(conn, {"ok": true, "paused": false})
 
 func _h_set_baseline(conn: StreamPeerTCP) -> void:
-	_baseline = SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	_baseline = _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
 	_baseline_set = true
-	HTTPServer.send_json(conn, {
+	_HTTPServer.send_json(conn, {
 		"ok": true,
 		"node_count": _baseline.size(),
 		"baseline_timestamp": Time.get_ticks_msec(),
@@ -101,19 +104,19 @@ func _h_set_baseline(conn: StreamPeerTCP) -> void:
 
 func _h_diff(conn: StreamPeerTCP) -> void:
 	if not _baseline_set:
-		HTTPServer.send_json(conn,
+		_HTTPServer.send_json(conn,
 			{"error": "No baseline set. Call POST /baseline first."}, 400)
 		return
-	var current := SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
-	var diff := SceneInspector.compute_diff(_baseline, current)
+	var current := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	var diff := _SceneInspector.compute_diff(_baseline, current)
 	diff["t_ms"] = Time.get_ticks_msec()
-	HTTPServer.send_json(conn, diff)
+	_HTTPServer.send_json(conn, diff)
 
 func _h_snapshot(conn: StreamPeerTCP) -> void:
-	var snap := SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	var snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
 	_baseline = snap
 	_baseline_set = true
-	HTTPServer.send_json(conn, {
+	_HTTPServer.send_json(conn, {
 		"ok": true,
 		"node_count": snap.size(),
 		"snapshot": snap,
@@ -131,7 +134,7 @@ func _h_observe(conn: StreamPeerTCP, params: Dictionary) -> void:
 func _observe_async(conn: StreamPeerTCP, snapshots: int, interval_ms: int) -> void:
 	# Auto-set baseline on first observe if none exists
 	if not _baseline_set:
-		_baseline = SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+		_baseline = _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
 		_baseline_set = true
 
 	var results: Array = []
@@ -145,14 +148,14 @@ func _observe_async(conn: StreamPeerTCP, snapshots: int, interval_ms: int) -> vo
 			else:
 				await get_tree().create_timer(interval_ms / 1000.0).timeout
 
-		var current := SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
-		var diff := SceneInspector.compute_diff(_baseline, current)
+		var current := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+		var diff := _SceneInspector.compute_diff(_baseline, current)
 		diff["t_ms"] = Time.get_ticks_msec()
 		if i == 0 and _paused:
 			diff["note"] = "game_paused_stepping_frames"
 		results.append(diff)
 
-	HTTPServer.send_json(conn, results)
+	_HTTPServer.send_json(conn, results)
 
 # ----------
 
@@ -167,7 +170,7 @@ func _step_async(conn: StreamPeerTCP, frames: int) -> void:
 	await _advance_frames(frames)
 	get_tree().paused = true
 	_paused = true
-	HTTPServer.send_json(conn, {
+	_HTTPServer.send_json(conn, {
 		"ok": true,
 		"frames_stepped": frames,
 		"elapsed_ms": Time.get_ticks_msec() - start_ms,
@@ -179,7 +182,7 @@ func _step_async(conn: StreamPeerTCP, frames: int) -> void:
 func _h_wait(conn: StreamPeerTCP, body: String) -> void:
 	var parsed := JSON.new()
 	if parsed.parse(body) != OK:
-		HTTPServer.send_json(conn, {"error": "Invalid JSON body"}, 400)
+		_HTTPServer.send_json(conn, {"error": "Invalid JSON body"}, 400)
 		return
 	_wait_async(conn, parsed.data)
 
@@ -191,7 +194,7 @@ func _wait_async(conn: StreamPeerTCP, data: Dictionary) -> void:
 	var timeout_ms: int = int(data.get("timeout_ms", 5000))
 
 	if node_path.is_empty() or property.is_empty():
-		HTTPServer.send_json(conn,
+		_HTTPServer.send_json(conn,
 			{"error": "node_path and property are required"}, 400)
 		return
 
@@ -210,7 +213,7 @@ func _wait_async(conn: StreamPeerTCP, data: Dictionary) -> void:
 		if current_value == null:
 			# Node or property disappeared
 			_restore_pause(was_paused)
-			HTTPServer.send_json(conn, {
+			_HTTPServer.send_json(conn, {
 				"ok": false,
 				"error": "Node or property not found: %s / %s" % [node_path, property],
 				"elapsed_ms": Time.get_ticks_msec() - start_ms,
@@ -219,9 +222,9 @@ func _wait_async(conn: StreamPeerTCP, data: Dictionary) -> void:
 
 		if _eval_condition(current_value, op, target_value, last_value):
 			_restore_pause(was_paused)
-			var current_snap := SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
-			var diff := SceneInspector.compute_diff(_baseline, current_snap)
-			HTTPServer.send_json(conn, {
+			var current_snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+			var diff := _SceneInspector.compute_diff(_baseline, current_snap)
+			_HTTPServer.send_json(conn, {
 				"ok": true,
 				"matched_value": _to_json_value(current_value),
 				"elapsed_ms": Time.get_ticks_msec() - start_ms,
@@ -232,7 +235,7 @@ func _wait_async(conn: StreamPeerTCP, data: Dictionary) -> void:
 		last_value = current_value
 
 	_restore_pause(was_paused)
-	HTTPServer.send_json(conn, {
+	_HTTPServer.send_json(conn, {
 		"ok": false,
 		"timeout": true,
 		"elapsed_ms": timeout_ms,
@@ -243,7 +246,7 @@ func _wait_async(conn: StreamPeerTCP, data: Dictionary) -> void:
 func _h_input(conn: StreamPeerTCP, body: String) -> void:
 	var parsed := JSON.new()
 	if parsed.parse(body) != OK:
-		HTTPServer.send_json(conn, {"error": "Invalid JSON body"}, 400)
+		_HTTPServer.send_json(conn, {"error": "Invalid JSON body"}, 400)
 		return
 	_input_async(conn, parsed.data)
 
@@ -256,7 +259,7 @@ func _input_async(conn: StreamPeerTCP, data: Dictionary) -> void:
 		var key_name := action.substr(4)
 		var keycode := OS.find_keycode_from_string(key_name)
 		if keycode == KEY_NONE:
-			HTTPServer.send_json(conn,
+			_HTTPServer.send_json(conn,
 				{"error": "Unknown key name: " + key_name}, 400)
 			return
 		await _press_key(keycode, duration_ms)
@@ -264,7 +267,7 @@ func _input_async(conn: StreamPeerTCP, data: Dictionary) -> void:
 	elif action.begins_with("click:"):
 		var parts := action.substr(6).split(",")
 		if parts.size() != 2:
-			HTTPServer.send_json(conn,
+			_HTTPServer.send_json(conn,
 				{"error": "click format must be click:X,Y"}, 400)
 			return
 		_fire_click(int(parts[0]), int(parts[1]))
@@ -272,7 +275,7 @@ func _input_async(conn: StreamPeerTCP, data: Dictionary) -> void:
 	else:
 		# Named InputMap action
 		if not InputMap.has_action(action):
-			HTTPServer.send_json(conn,
+			_HTTPServer.send_json(conn,
 				{"error": "Unknown InputMap action: " + action
 				+ ". Available: " + ", ".join(InputMap.get_actions())}, 400)
 			return
@@ -280,7 +283,7 @@ func _input_async(conn: StreamPeerTCP, data: Dictionary) -> void:
 		await get_tree().create_timer(duration_ms / 1000.0).timeout
 		Input.action_release(action)
 
-	HTTPServer.send_json(conn, {
+	_HTTPServer.send_json(conn, {
 		"ok": true,
 		"action": action,
 		"t_ms": Time.get_ticks_msec() - start_ms,
@@ -309,7 +312,7 @@ func _frame_async(conn: StreamPeerTCP, params: Dictionary) -> void:
 	var jpg_bytes := img.save_jpg_to_buffer(quality)
 	var b64 := Marshalls.raw_to_base64(jpg_bytes)
 
-	HTTPServer.send_json(conn, {
+	_HTTPServer.send_json(conn, {
 		"image": b64,
 		"width": img.get_width(),
 		"height": img.get_height(),
