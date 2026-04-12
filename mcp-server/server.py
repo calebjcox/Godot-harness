@@ -14,12 +14,16 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
+import subprocess
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent
 
 from godot_client import GodotClient
+
+_godot_process: subprocess.Popen | None = None
 
 mcp = FastMCP(
     "godot-harness",
@@ -267,6 +271,90 @@ def capture_frame(scale: float = 0.5, quality: float = 0.75) -> list[ImageConten
             mimeType="image/jpeg",
         )
     ]
+
+
+# ---------------------------------------------------------------------------
+# Godot process lifecycle
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def start_godot(
+    project_path: str,
+    godot_executable: str = "godot",
+) -> str:
+    """
+    Launch Godot for the given project and capture the process PID.
+
+    Starts Godot with `godot --path <project_path>`. The ClaudeHarness plugin
+    must be enabled in the project for the other tools to connect.
+
+    Args:
+        project_path: absolute path to the Godot project (directory containing
+                      project.godot).
+        godot_executable: name or full path of the Godot binary (default "godot",
+                          assuming it is on PATH).
+
+    Returns {ok, pid, project_path} on success, or {ok: false, error} on failure.
+    After calling this, wait 2–3 seconds then check get_status() to confirm the
+    plugin is listening.
+    """
+    global _godot_process
+    if _godot_process is not None and _godot_process.poll() is None:
+        return json.dumps({
+            "ok": False,
+            "error": "Godot is already running",
+            "pid": _godot_process.pid,
+        })
+    exe = godot_executable or shutil.which("godot") or "godot"
+    try:
+        _godot_process = subprocess.Popen(
+            [exe, "--path", project_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return json.dumps({
+            "ok": True,
+            "pid": _godot_process.pid,
+            "project_path": project_path,
+        })
+    except FileNotFoundError:
+        return json.dumps({"ok": False, "error": f"Godot executable not found: {exe}"})
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)})
+
+
+@mcp.tool()
+def stop_godot() -> str:
+    """
+    Stop the Godot process that was started with start_godot().
+
+    Sends SIGTERM (or platform equivalent) and waits up to 5 seconds for a
+    clean exit; sends SIGKILL if it does not exit in time.
+
+    Returns {ok, pid, stopped: true} on success.
+    Returns {ok: false, error} if no process is tracked or it has already exited.
+    """
+    global _godot_process
+    if _godot_process is None:
+        return json.dumps({
+            "ok": False,
+            "error": "No Godot process tracked. Use start_godot() first.",
+        })
+    pid = _godot_process.pid
+    if _godot_process.poll() is not None:
+        _godot_process = None
+        return json.dumps({
+            "ok": False,
+            "error": f"Godot process (pid={pid}) has already exited.",
+        })
+    try:
+        _godot_process.terminate()
+        _godot_process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        _godot_process.kill()
+    _godot_process = None
+    return json.dumps({"ok": True, "pid": pid, "stopped": True})
 
 
 # ---------------------------------------------------------------------------

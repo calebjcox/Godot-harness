@@ -271,6 +271,7 @@ func _input_async(conn: StreamPeerTCP, data: Dictionary) -> void:
 				{"error": "click format must be click:X,Y"}, 400)
 			return
 		_fire_click(int(parts[0]), int(parts[1]))
+		await get_tree().create_timer(duration_ms / 1000.0).timeout
 
 	else:
 		# Named InputMap action
