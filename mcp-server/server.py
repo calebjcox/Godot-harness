@@ -309,7 +309,7 @@ def start_godot(
     exe = godot_executable or shutil.which("godot") or "godot"
     try:
         _godot_process = subprocess.Popen(
-            [exe, "--path", project_path],
+            [exe, "--path", project_path, "--", "--claude-harness"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

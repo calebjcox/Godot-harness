@@ -23,6 +23,9 @@ func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	name = "ClaudeHarness"
 
+	if not "--claude-harness" in OS.get_cmdline_user_args():
+		return  # not launched by the harness; skip HTTP server to avoid port conflicts
+
 	var port: int = ProjectSettings.get_setting("claude_harness/port", DEFAULT_PORT)
 
 	_server = load("res://addons/claude_harness/autoload/http_server.gd").new()
