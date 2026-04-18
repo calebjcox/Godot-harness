@@ -16,6 +16,7 @@ import math
 import os
 import shutil
 import subprocess
+import urllib.parse
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -180,6 +181,84 @@ def get_snapshot(output_path: str | None = None) -> str:
         })
 
     return json.dumps(data, indent=2)
+
+
+@mcp.tool()
+def find_nodes(class_filter: str = "", keyword: str = "") -> str:
+    """
+    Return only the nodes that match a class name or a text/property keyword.
+
+    OR logic: a node is included if it matches class_filter OR keyword (or both).
+    If neither is supplied, all nodes are returned (equivalent to the snapshot dict).
+
+    Args:
+        class_filter: case-insensitive substring matched against the node's class
+                      (e.g. "Button", "Label", "AnimationPlayer")
+        keyword:      case-insensitive substring matched against any string property
+                      value (text, current_animation, animation, placeholder_text…)
+
+    Returns {ok, nodes: {path: {class, visible, …}}, count}.
+    """
+    cf = urllib.parse.quote(class_filter)
+    kw = urllib.parse.quote(keyword)
+    return client.get(f"/find_nodes?class_filter={cf}&keyword={kw}")
+
+
+@mcp.tool()
+def get_ui_state() -> str:
+    """
+    Return all visible Control nodes with their current UI state, flattened.
+
+    Uses Godot's native `node is Control` check, so Button, Label, LineEdit,
+    ProgressBar, OptionButton, etc. are all included without string matching.
+    Invisible controls are excluded.
+
+    Returns {ok, nodes: {path: {class, visible, text?, value?, disabled?}}, count}.
+    Faster and cheaper than get_snapshot when you only care about the UI layer.
+    """
+    return client.get("/ui_state")
+
+
+@mcp.tool()
+def assert_node_exists(path: str) -> str:
+    """
+    Assert that a node exists at the given path in the current scene tree.
+
+    Raises RuntimeError (tool error visible to Claude) if the node is not found.
+    On success returns {ok, path, class, …all captured properties}.
+
+    Args:
+        path: snapshot-style path, e.g. "root/HUD/HealthBar"
+    """
+    encoded = urllib.parse.quote(path)
+    data = client.get_json(f"/assert_node?path={encoded}")
+    if not data.get("ok"):
+        raise RuntimeError(f"assert_node_exists failed: node not found: {path}")
+    return json.dumps(data)
+
+
+@mcp.tool()
+def assert_text(path: str, expected: str) -> str:
+    """
+    Assert that a node's text property equals the expected string.
+
+    Raises RuntimeError on mismatch:  "assert_text failed: expected 'X' but got 'Y'"
+    Raises RuntimeError if not found: "assert_text failed: node not found: <path>"
+    On success returns {ok, path, text}.
+
+    Args:
+        path:     snapshot-style path, e.g. "root/HUD/ScoreLabel"
+        expected: the exact text value expected
+    """
+    encoded_path = urllib.parse.quote(path)
+    encoded_expected = urllib.parse.quote(expected)
+    data = client.get_json(
+        f"/assert_text?path={encoded_path}&expected={encoded_expected}"
+    )
+    if not data.get("ok"):
+        error = data.get("error", "unknown error")
+        raise RuntimeError(f"assert_text failed: {error}")
+    return json.dumps(data)
 
 
 @mcp.tool()
