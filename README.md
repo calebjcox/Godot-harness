@@ -42,10 +42,13 @@ Then enable it: **Project → Project Settings → Plugins → ClaudeHarness →
 
 The plugin registers a `ClaudeHarness` autoload that starts an HTTP server on `localhost:9080` whenever the game runs.
 
-Optional — change the port via ProjectSettings:
+Optional — change defaults via ProjectSettings:
 ```
 claude_harness/port = 9080
+claude_harness/extra_snapshot_props = ["disabled", "button_pressed"]
 ```
+
+`extra_snapshot_props` lists additional node properties to include in every snapshot. See [extra_props](#extra_props) below.
 
 ### 2. Python MCP server
 
@@ -101,18 +104,53 @@ Override the default port if needed by adding `"env": {"GODOT_HARNESS_URL": "htt
 
 ## Tools
 
+### Configuration
 | Tool | Type | Purpose |
 |------|------|---------|
 | `get_status()` | sync | Confirm plugin is running, get scene name and FPS |
+| `get_config()` | sync | Show current harness config including `extra_props` |
+| `configure(extra_props)` | sync | Update `extra_props` at runtime without restarting Godot |
+
+### Game control
+| Tool | Type | Purpose |
+|------|------|---------|
 | `pause_game()` | sync | Freeze game time |
 | `resume_game()` | sync | Unfreeze game time |
 | `step_frames(n)` | async | Advance exactly N frames then re-pause |
+| `start_godot(project_path, godot_executable)` | sync | Launch Godot process |
+| `stop_godot()` | sync | Stop the Godot process started by `start_godot` |
+
+### Observation
+| Tool | Type | Purpose |
+|------|------|---------|
 | `set_baseline()` | sync | Mark current state as diff reference point |
 | `observe_scene(snapshots, interval_ms)` | async | JSON diff sequence — primary observation tool |
 | `get_diff()` | sync | Single diff vs baseline, on demand |
 | `get_snapshot(output_path)` | sync | Full scene state (large; use sparingly) |
+| `get_ui_state()` | sync | Visible Control nodes only — cheaper than full snapshot |
+| `find_nodes(class_filter, keyword, prop_filter, prop_value)` | sync | Filter snapshot by class, text, or property value |
+| `get_node_property(path, property)` | sync | Read one property without a full snapshot |
+| `get_viewport_size()` | sync | Game window dimensions |
+| `get_node_rect(path)` | sync | Screen-space rect of a Control node with `center_x`/`center_y` |
+| `get_autoload_var(autoload, variable)` | sync | Read any autoload singleton variable |
+
+### Interaction
+| Tool | Type | Purpose |
+|------|------|---------|
+| `send_input(action, duration_ms)` | async | Inject keyboard/mouse/hover input |
 | `wait_for_condition(node_path, property, op, value, timeout_ms)` | async | Wait for state change, then pause |
-| `send_input(action, duration_ms)` | async | Inject keyboard/mouse/action input |
+| `wait_for_node_visible(node_path, timeout_ms)` | async | Shorthand — wait until a node becomes visible |
+
+### Assertions
+| Tool | Type | Purpose |
+|------|------|---------|
+| `assert_node_exists(path)` | sync | Raise if node not in scene tree |
+| `assert_text(path, expected)` | sync | Raise if node's text doesn't match |
+| `assert_node_property(path, prop, expected)` | sync | Raise if any property doesn't match |
+
+### Capture
+| Tool | Type | Purpose |
+|------|------|---------|
 | `capture_frame(scale, quality)` | async | Viewport JPEG — secondary visual check |
 
 ---
@@ -196,10 +234,11 @@ Empty `appeared`, `disappeared`, `changed` = nothing changed since baseline.
 | InputMap action | `"ui_accept"` | Named action from your project's InputMap |
 | Key name | `"key:Space"` | Key by name (uses Godot's key name strings) |
 | Mouse click | `"click:320,240"` | Left click at screen coordinates |
+| Mouse hover | `"hover:320,240"` | Move cursor without clicking — triggers `mouse_entered` |
 
 Common InputMap actions (Godot builtins): `ui_accept`, `ui_cancel`, `ui_up`, `ui_down`, `ui_left`, `ui_right`, `ui_select`.
 
-Use `get_status()` to get a list of all available actions if unsure.
+For reliable click coordinates on UI nodes, use `get_node_rect(path)` to get `center_x`/`center_y` rather than reading `global_position` from the snapshot.
 
 ---
 
@@ -220,6 +259,27 @@ For scalar or string properties, use the property name directly:
 "current_animation"    → AnimationPlayer.current_animation
 "visible"              → node.visible
 ```
+
+---
+
+## extra_props
+
+By default the snapshot captures a fixed set of properties (class, visible, position, text, value, etc.). To include additional properties in every snapshot, configure `extra_props`:
+
+```python
+# At the start of a test session, before set_baseline()
+configure(extra_props=["disabled", "button_pressed", "color", "modulate"])
+```
+
+Changes take effect immediately and persist until Godot restarts. For project-level defaults that persist across restarts, set in ProjectSettings:
+
+```
+claude_harness/extra_snapshot_props = ["disabled", "button_pressed"]
+```
+
+Any property accessible via `node.get(prop)` can be listed — Godot will silently skip it for nodes that don't have it. Properties that require special serialization (`theme`, `ColorRect.color`) are always captured regardless of `extra_props`.
+
+`get_config()` shows the currently active list.
 
 ---
 
