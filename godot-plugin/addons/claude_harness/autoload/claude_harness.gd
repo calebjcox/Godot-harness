@@ -172,7 +172,8 @@ func _h_find_nodes(conn: StreamPeerTCP, params: Dictionary) -> void:
 					matched = true
 					break
 		if matched and prop_filter != "":
-			var live_node := get_node_or_null(NodePath(node_path))
+			var abs_path: String = node_path if node_path.begins_with("/") else "/" + node_path
+			var live_node := get_node_or_null(NodePath(abs_path))
 			if live_node == null:
 				matched = false
 			else:
@@ -297,7 +298,8 @@ func _h_get_node_rect(conn: StreamPeerTCP, params: Dictionary) -> void:
 	if path.is_empty():
 		_HTTPServer.send_json(conn, {"error": "path param required"}, 400)
 		return
-	var node := get_node_or_null(NodePath(path))
+	var abs_path: String = path if path.begins_with("/") else "/" + path
+	var node := get_node_or_null(NodePath(abs_path))
 	if node == null:
 		_HTTPServer.send_json(conn, {"ok": false, "error": "Node not found: " + path})
 		return
@@ -368,7 +370,7 @@ func _h_assert_property(conn: StreamPeerTCP, params: Dictionary) -> void:
 			"message": "Node or property not found: %s / %s" % [path, prop]})
 		return
 	var actual_str: String = str(_to_json_value(actual))
-	var matched: bool = (actual_str == expected)
+	var matched: bool = (actual_str == expected or actual_str.to_lower() == expected.to_lower())
 	_HTTPServer.send_json(conn, {
 		"ok": matched, "path": path, "prop": prop,
 		"expected": expected, "actual": actual_str,
@@ -608,7 +610,8 @@ func _advance_frames(n: int) -> void:
 		await RenderingServer.frame_post_draw
 
 func _read_property(node_path: String, prop_path: String) -> Variant:
-	var node := get_node_or_null(NodePath(node_path))
+	var abs_path: String = node_path if node_path.begins_with("/") else "/" + node_path
+	var node := get_node_or_null(NodePath(abs_path))
 	if node == null:
 		return null
 
