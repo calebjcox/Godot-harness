@@ -12,9 +12,10 @@ const MAX_DEPTH := 8
 # ---------------------------------------------------------------------------
 
 ## Walk the scene tree from root and return a flat snapshot dictionary.
-static func take_snapshot(root: Node, max_depth: int = MAX_DEPTH) -> Dictionary:
+static func take_snapshot(root: Node, max_depth: int = MAX_DEPTH,
+		extra_props: PackedStringArray = []) -> Dictionary:
 	var result: Dictionary = {}
-	_walk(root, "", 0, max_depth, result)
+	_walk(root, "", 0, max_depth, result, extra_props)
 	return result
 
 ## Compute a diff between a baseline snapshot and a current snapshot.
@@ -47,21 +48,21 @@ static func compute_diff(baseline: Dictionary, current: Dictionary) -> Dictionar
 # ---------------------------------------------------------------------------
 
 static func _walk(node: Node, parent_path: String, depth: int,
-		max_depth: int, result: Dictionary) -> void:
+		max_depth: int, result: Dictionary, extra_props: PackedStringArray) -> void:
 	if depth > max_depth:
 		return
 
 	var node_path := (parent_path + "/" + node.name) if parent_path != "" else node.name
-	result[node_path] = _capture(node)
+	result[node_path] = _capture(node, extra_props)
 
 	for child in node.get_children():
-		_walk(child, node_path, depth + 1, max_depth, result)
+		_walk(child, node_path, depth + 1, max_depth, result, extra_props)
 
 # ---------------------------------------------------------------------------
 # Property capture
 # ---------------------------------------------------------------------------
 
-static func _capture(node: Node) -> Dictionary:
+static func _capture(node: Node, extra_props: PackedStringArray = []) -> Dictionary:
 	var props: Dictionary = {"class": node.get_class()}
 
 	# Scene file (only the filename, not full path, to keep output compact)
@@ -109,6 +110,9 @@ static func _capture(node: Node) -> Dictionary:
 			var cms = node.custom_minimum_size
 			if cms != Vector2.ZERO:
 				props["custom_minimum_size"] = _v2(cms)
+		if node.theme != null:
+			var rp: String = node.theme.resource_path
+			props["theme"] = rp if rp != "" else "<inline>"
 
 	# Common UI content properties
 	for prop in ["text", "placeholder_text", "tooltip_text"]:
@@ -155,6 +159,20 @@ static func _capture(node: Node) -> Dictionary:
 		if "volume_db" in node:
 			props["volume_db"] = snappedf(node.volume_db, 0.1)
 
+	# ---- ColorRect — always capture color and modulate unconditionally ----
+	if node.get_class() == "ColorRect":
+		props["color"] = _color(node.color)
+		props["modulate"] = _color(node.modulate)
+		props["self_modulate"] = _color(node.self_modulate)
+
+	# ---- Caller-specified extra properties ----
+	for prop in extra_props:
+		if prop in props:
+			continue
+		var val = node.get(prop)
+		if val != null:
+			props[prop] = _serialize(val)
+
 	return props
 
 # ---------------------------------------------------------------------------
@@ -195,3 +213,10 @@ static func _color(c: Color) -> Dictionary:
 		"b": snappedf(c.b, 0.01),
 		"a": snappedf(c.a, 0.01),
 	}
+
+static func _serialize(v: Variant) -> Variant:
+	if v is Vector2: return _v2(v)
+	if v is Vector3: return _v3(v)
+	if v is Color:   return _color(v)
+	if v is bool or v is int or v is float or v is String: return v
+	return str(v)
