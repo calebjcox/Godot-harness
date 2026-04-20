@@ -14,6 +14,7 @@ var _baseline: Dictionary = {}
 var _baseline_set := false
 var _paused := false    # tracks OUR pause state (may differ from get_tree().paused if
                          # another system pauses the tree)
+var _extra_props: PackedStringArray = []
 
 # ---------------------------------------------------------------------------
 # Lifecycle
@@ -27,6 +28,8 @@ func _ready() -> void:
 		return  # not launched by the harness; skip HTTP server to avoid port conflicts
 
 	var port: int = ProjectSettings.get_setting("claude_harness/port", DEFAULT_PORT)
+	var ep = ProjectSettings.get_setting("claude_harness/extra_snapshot_props", [])
+	_extra_props = PackedStringArray(ep)
 
 	_server = load("res://addons/claude_harness/autoload/http_server.gd").new()
 	_server.process_mode = Node.PROCESS_MODE_ALWAYS
@@ -77,6 +80,22 @@ func _on_request(conn: StreamPeerTCP, method: String, path: String,
 			_h_assert_node(conn, params)
 		"/assert_text":
 			_h_assert_text(conn, params)
+		"/config":
+			_h_get_config(conn)
+		"/configure":
+			_h_configure(conn, body)
+		"/get_node_property":
+			_h_get_node_property(conn, params)
+		"/get_viewport_size":
+			_h_get_viewport_size(conn)
+		"/get_node_rect":
+			_h_get_node_rect(conn, params)
+		"/get_autoload_var":
+			_h_get_autoload_var(conn, params)
+		"/wait_for_visible":
+			_h_wait_for_visible(conn, body)
+		"/assert_property":
+			_h_assert_property(conn, params)
 		_:
 			_HTTPServer.send_json(conn, {"error": "Unknown path: " + path}, 404)
 
@@ -105,7 +124,7 @@ func _h_resume(conn: StreamPeerTCP) -> void:
 	_HTTPServer.send_json(conn, {"ok": true, "paused": false})
 
 func _h_set_baseline(conn: StreamPeerTCP) -> void:
-	_baseline = _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	_baseline = _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH, _extra_props)
 	_baseline_set = true
 	_HTTPServer.send_json(conn, {
 		"ok": true,
@@ -118,13 +137,13 @@ func _h_diff(conn: StreamPeerTCP) -> void:
 		_HTTPServer.send_json(conn,
 			{"error": "No baseline set. Call POST /baseline first."}, 400)
 		return
-	var current := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	var current := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH, _extra_props)
 	var diff := _SceneInspector.compute_diff(_baseline, current)
 	diff["t_ms"] = Time.get_ticks_msec()
 	_HTTPServer.send_json(conn, diff)
 
 func _h_snapshot(conn: StreamPeerTCP) -> void:
-	var snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	var snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH, _extra_props)
 	_baseline = snap
 	_baseline_set = true
 	_HTTPServer.send_json(conn, {
@@ -136,7 +155,9 @@ func _h_snapshot(conn: StreamPeerTCP) -> void:
 func _h_find_nodes(conn: StreamPeerTCP, params: Dictionary) -> void:
 	var class_filter: String = params.get("class_filter", "")
 	var keyword: String = params.get("keyword", "")
-	var snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	var prop_filter: String = params.get("prop_filter", "")
+	var prop_value: String = params.get("prop_value", "")
+	var snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH, _extra_props)
 	var nodes: Dictionary = {}
 	for node_path in snap:
 		var props: Dictionary = snap[node_path]
@@ -150,6 +171,12 @@ func _h_find_nodes(conn: StreamPeerTCP, params: Dictionary) -> void:
 				if val is String and val.findn(keyword) != -1:
 					matched = true
 					break
+		if matched and prop_filter != "":
+			var live_node := get_node_or_null(NodePath(node_path))
+			if live_node == null:
+				matched = false
+			else:
+				matched = (str(live_node.get(prop_filter)) == prop_value)
 		if matched:
 			nodes[node_path] = props
 	_HTTPServer.send_json(conn, {"ok": true, "nodes": nodes, "count": nodes.size()})
@@ -184,7 +211,7 @@ func _h_assert_node(conn: StreamPeerTCP, params: Dictionary) -> void:
 	if path.is_empty():
 		_HTTPServer.send_json(conn, {"error": "path param required"}, 400)
 		return
-	var snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	var snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH, _extra_props)
 	if path not in snap:
 		_HTTPServer.send_json(conn, {"ok": false, "path": path})
 		return
@@ -200,7 +227,7 @@ func _h_assert_text(conn: StreamPeerTCP, params: Dictionary) -> void:
 	if path.is_empty():
 		_HTTPServer.send_json(conn, {"error": "path param required"}, 400)
 		return
-	var snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	var snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH, _extra_props)
 	if path not in snap:
 		_HTTPServer.send_json(conn, {
 			"ok": false,
@@ -224,6 +251,131 @@ func _h_assert_text(conn: StreamPeerTCP, params: Dictionary) -> void:
 	_HTTPServer.send_json(conn, {"ok": true, "path": path, "text": actual})
 
 
+func _h_get_config(conn: StreamPeerTCP) -> void:
+	_HTTPServer.send_json(conn, {
+		"ok": true,
+		"port": DEFAULT_PORT,
+		"snap_depth": SNAP_DEPTH,
+		"extra_props": Array(_extra_props),
+	})
+
+
+func _h_configure(conn: StreamPeerTCP, body: String) -> void:
+	var parsed := JSON.new()
+	if parsed.parse(body) != OK:
+		_HTTPServer.send_json(conn, {"error": "Invalid JSON body"}, 400)
+		return
+	var data: Dictionary = parsed.data
+	if "extra_props" in data:
+		_extra_props = PackedStringArray(data["extra_props"])
+	_HTTPServer.send_json(conn, {"ok": true, "extra_props": Array(_extra_props)})
+
+
+func _h_get_node_property(conn: StreamPeerTCP, params: Dictionary) -> void:
+	var path: String = params.get("path", "")
+	var property: String = params.get("property", "")
+	if path.is_empty() or property.is_empty():
+		_HTTPServer.send_json(conn, {"error": "path and property params required"}, 400)
+		return
+	var value = _read_property(path, property)
+	if value == null:
+		_HTTPServer.send_json(conn, {"ok": false,
+			"error": "Node or property not found: %s / %s" % [path, property]})
+		return
+	_HTTPServer.send_json(conn, {"ok": true, "path": path,
+		"property": property, "value": _to_json_value(value)})
+
+
+func _h_get_viewport_size(conn: StreamPeerTCP) -> void:
+	var rect: Rect2 = get_viewport().get_visible_rect()
+	_HTTPServer.send_json(conn, {"ok": true,
+		"width": int(rect.size.x), "height": int(rect.size.y)})
+
+
+func _h_get_node_rect(conn: StreamPeerTCP, params: Dictionary) -> void:
+	var path: String = params.get("path", "")
+	if path.is_empty():
+		_HTTPServer.send_json(conn, {"error": "path param required"}, 400)
+		return
+	var node := get_node_or_null(NodePath(path))
+	if node == null:
+		_HTTPServer.send_json(conn, {"ok": false, "error": "Node not found: " + path})
+		return
+	if not node is Control:
+		_HTTPServer.send_json(conn, {"ok": false,
+			"error": "Node is not a Control (class: %s)" % node.get_class()})
+		return
+	var rect: Rect2 = node.get_global_rect()
+	_HTTPServer.send_json(conn, {
+		"ok": true, "path": path,
+		"x": int(rect.position.x), "y": int(rect.position.y),
+		"width": int(rect.size.x), "height": int(rect.size.y),
+		"center_x": int(rect.position.x + rect.size.x / 2.0),
+		"center_y": int(rect.position.y + rect.size.y / 2.0),
+	})
+
+
+func _h_get_autoload_var(conn: StreamPeerTCP, params: Dictionary) -> void:
+	var autoload_name: String = params.get("autoload", "")
+	var variable: String = params.get("variable", "")
+	if autoload_name.is_empty() or variable.is_empty():
+		_HTTPServer.send_json(conn, {"error": "autoload and variable params required"}, 400)
+		return
+	var node := get_node_or_null(NodePath("/root/" + autoload_name))
+	if node == null:
+		_HTTPServer.send_json(conn, {"ok": false,
+			"error": "Autoload not found: " + autoload_name})
+		return
+	var value = node.get(variable)
+	if value == null:
+		_HTTPServer.send_json(conn, {"ok": false,
+			"error": "Variable not found on %s: %s" % [autoload_name, variable]})
+		return
+	_HTTPServer.send_json(conn, {"ok": true, "autoload": autoload_name,
+		"variable": variable, "value": _to_json_value(value)})
+
+
+func _h_wait_for_visible(conn: StreamPeerTCP, body: String) -> void:
+	var parsed := JSON.new()
+	if parsed.parse(body) != OK:
+		_HTTPServer.send_json(conn, {"error": "Invalid JSON body"}, 400)
+		return
+	var data: Dictionary = parsed.data
+	var path: String = data.get("node_path", "")
+	if path.is_empty():
+		_HTTPServer.send_json(conn, {"error": "node_path required"}, 400)
+		return
+	_wait_async(conn, {
+		"node_path": path,
+		"property": "visible",
+		"op": "eq",
+		"value": true,
+		"timeout_ms": int(data.get("timeout_ms", 5000)),
+	})
+
+
+func _h_assert_property(conn: StreamPeerTCP, params: Dictionary) -> void:
+	var path: String = params.get("path", "")
+	var prop: String = params.get("prop", "")
+	var expected: String = params.get("expected", "")
+	if path.is_empty() or prop.is_empty():
+		_HTTPServer.send_json(conn, {"error": "path and prop params required"}, 400)
+		return
+	var actual = _read_property(path, prop)
+	if actual == null:
+		_HTTPServer.send_json(conn, {"ok": false, "path": path, "prop": prop,
+			"expected": expected, "actual": null,
+			"message": "Node or property not found: %s / %s" % [path, prop]})
+		return
+	var actual_str: String = str(_to_json_value(actual))
+	var matched: bool = (actual_str == expected)
+	_HTTPServer.send_json(conn, {
+		"ok": matched, "path": path, "prop": prop,
+		"expected": expected, "actual": actual_str,
+		"message": "OK" if matched else "expected '%s' but got '%s'" % [expected, actual_str],
+	})
+
+
 # ---------------------------------------------------------------------------
 # Async handlers — fire-and-forget coroutines
 # ---------------------------------------------------------------------------
@@ -236,7 +388,7 @@ func _h_observe(conn: StreamPeerTCP, params: Dictionary) -> void:
 func _observe_async(conn: StreamPeerTCP, snapshots: int, interval_ms: int) -> void:
 	# Auto-set baseline on first observe if none exists
 	if not _baseline_set:
-		_baseline = _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+		_baseline = _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH, _extra_props)
 		_baseline_set = true
 
 	var results: Array = []
@@ -250,7 +402,7 @@ func _observe_async(conn: StreamPeerTCP, snapshots: int, interval_ms: int) -> vo
 			else:
 				await get_tree().create_timer(interval_ms / 1000.0).timeout
 
-		var current := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+		var current := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH, _extra_props)
 		var diff := _SceneInspector.compute_diff(_baseline, current)
 		diff["t_ms"] = Time.get_ticks_msec()
 		if i == 0 and _paused:
@@ -324,7 +476,7 @@ func _wait_async(conn: StreamPeerTCP, data: Dictionary) -> void:
 
 		if _eval_condition(current_value, op, target_value, last_value):
 			_restore_pause(was_paused)
-			var current_snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+			var current_snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH, _extra_props)
 			var diff := _SceneInspector.compute_diff(_baseline, current_snap)
 			_HTTPServer.send_json(conn, {
 				"ok": true,
@@ -373,6 +525,15 @@ func _input_async(conn: StreamPeerTCP, data: Dictionary) -> void:
 				{"error": "click format must be click:X,Y"}, 400)
 			return
 		_fire_click(int(parts[0]), int(parts[1]))
+		await get_tree().create_timer(duration_ms / 1000.0).timeout
+
+	elif action.begins_with("hover:"):
+		var parts := action.substr(6).split(",")
+		if parts.size() != 2:
+			_HTTPServer.send_json(conn,
+				{"error": "hover format must be hover:X,Y"}, 400)
+			return
+		_fire_hover(int(parts[0]), int(parts[1]))
 		await get_tree().create_timer(duration_ms / 1000.0).timeout
 
 	else:
@@ -514,3 +675,11 @@ func _fire_click(x: int, y: int) -> void:
 		ev.button_index = MOUSE_BUTTON_LEFT
 		ev.pressed = pressed
 		Input.parse_input_event(ev)
+
+func _fire_hover(x: int, y: int) -> void:
+	var ev := InputEventMouseMotion.new()
+	ev.position = Vector2(x, y)
+	ev.global_position = Vector2(x, y)
+	ev.relative = Vector2.ZERO
+	ev.velocity = Vector2.ZERO
+	Input.parse_input_event(ev)
