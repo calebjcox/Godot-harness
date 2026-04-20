@@ -23,6 +23,9 @@ func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	name = "ClaudeHarness"
 
+	if not "--claude-harness" in OS.get_cmdline_user_args():
+		return  # not launched by the harness; skip HTTP server to avoid port conflicts
+
 	var port: int = ProjectSettings.get_setting("claude_harness/port", DEFAULT_PORT)
 
 	_server = load("res://addons/claude_harness/autoload/http_server.gd").new()
@@ -66,6 +69,14 @@ func _on_request(conn: StreamPeerTCP, method: String, path: String,
 			_h_input(conn, body)
 		"/frame":
 			_h_frame(conn, params)
+		"/find_nodes":
+			_h_find_nodes(conn, params)
+		"/ui_state":
+			_h_ui_state(conn)
+		"/assert_node":
+			_h_assert_node(conn, params)
+		"/assert_text":
+			_h_assert_text(conn, params)
 		_:
 			_HTTPServer.send_json(conn, {"error": "Unknown path: " + path}, 404)
 
@@ -121,6 +132,97 @@ func _h_snapshot(conn: StreamPeerTCP) -> void:
 		"node_count": snap.size(),
 		"snapshot": snap,
 	})
+
+func _h_find_nodes(conn: StreamPeerTCP, params: Dictionary) -> void:
+	var class_filter: String = params.get("class_filter", "")
+	var keyword: String = params.get("keyword", "")
+	var snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	var nodes: Dictionary = {}
+	for node_path in snap:
+		var props: Dictionary = snap[node_path]
+		var matched := (class_filter == "" and keyword == "")
+		if not matched and class_filter != "":
+			if props.get("class", "").findn(class_filter) != -1:
+				matched = true
+		if not matched and keyword != "":
+			for key in props:
+				var val = props[key]
+				if val is String and val.findn(keyword) != -1:
+					matched = true
+					break
+		if matched:
+			nodes[node_path] = props
+	_HTTPServer.send_json(conn, {"ok": true, "nodes": nodes, "count": nodes.size()})
+
+
+func _h_ui_state(conn: StreamPeerTCP) -> void:
+	var nodes: Dictionary = {}
+	_collect_ui_state(get_tree().root, "", nodes)
+	_HTTPServer.send_json(conn, {"ok": true, "nodes": nodes, "count": nodes.size()})
+
+func _collect_ui_state(node: Node, parent_path: String, result: Dictionary) -> void:
+	var node_path := (parent_path + "/" + node.name) if parent_path != "" else node.name
+	if node is Control and node.is_visible_in_tree():
+		var props: Dictionary = {"class": node.get_class(), "visible": true}
+		if "text" in node:
+			var t = node.get("text")
+			if t is String:
+				props["text"] = t
+		if "value" in node:
+			var v = node.get("value")
+			if v is float or v is int:
+				props["value"] = v
+		if "disabled" in node:
+			props["disabled"] = bool(node.get("disabled"))
+		result[node_path] = props
+	for child in node.get_children():
+		_collect_ui_state(child, node_path, result)
+
+
+func _h_assert_node(conn: StreamPeerTCP, params: Dictionary) -> void:
+	var path: String = params.get("path", "")
+	if path.is_empty():
+		_HTTPServer.send_json(conn, {"error": "path param required"}, 400)
+		return
+	var snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	if path not in snap:
+		_HTTPServer.send_json(conn, {"ok": false, "path": path})
+		return
+	var props: Dictionary = snap[path].duplicate()
+	props["ok"] = true
+	props["path"] = path
+	_HTTPServer.send_json(conn, props)
+
+
+func _h_assert_text(conn: StreamPeerTCP, params: Dictionary) -> void:
+	var path: String = params.get("path", "")
+	var expected: String = params.get("expected", "")
+	if path.is_empty():
+		_HTTPServer.send_json(conn, {"error": "path param required"}, 400)
+		return
+	var snap := _SceneInspector.take_snapshot(get_tree().root, SNAP_DEPTH)
+	if path not in snap:
+		_HTTPServer.send_json(conn, {
+			"ok": false,
+			"error": "node not found: " + path,
+		})
+		return
+	var props: Dictionary = snap[path]
+	if "text" not in props:
+		_HTTPServer.send_json(conn, {
+			"ok": false,
+			"error": "node has no text property: " + path,
+		})
+		return
+	var actual: String = str(props["text"])
+	if actual != expected:
+		_HTTPServer.send_json(conn, {
+			"ok": false,
+			"error": "expected '%s' but got '%s'" % [expected, actual],
+		})
+		return
+	_HTTPServer.send_json(conn, {"ok": true, "path": path, "text": actual})
+
 
 # ---------------------------------------------------------------------------
 # Async handlers — fire-and-forget coroutines
@@ -271,6 +373,7 @@ func _input_async(conn: StreamPeerTCP, data: Dictionary) -> void:
 				{"error": "click format must be click:X,Y"}, 400)
 			return
 		_fire_click(int(parts[0]), int(parts[1]))
+		await get_tree().create_timer(duration_ms / 1000.0).timeout
 
 	else:
 		# Named InputMap action

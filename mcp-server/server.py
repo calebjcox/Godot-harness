@@ -14,12 +14,17 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
+import subprocess
+import urllib.parse
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent
 
 from godot_client import GodotClient
+
+_godot_process: subprocess.Popen | None = None
 
 mcp = FastMCP(
     "godot-harness",
@@ -179,6 +184,84 @@ def get_snapshot(output_path: str | None = None) -> str:
 
 
 @mcp.tool()
+def find_nodes(class_filter: str = "", keyword: str = "") -> str:
+    """
+    Return only the nodes that match a class name or a text/property keyword.
+
+    OR logic: a node is included if it matches class_filter OR keyword (or both).
+    If neither is supplied, all nodes are returned (equivalent to the snapshot dict).
+
+    Args:
+        class_filter: case-insensitive substring matched against the node's class
+                      (e.g. "Button", "Label", "AnimationPlayer")
+        keyword:      case-insensitive substring matched against any string property
+                      value (text, current_animation, animation, placeholder_text…)
+
+    Returns {ok, nodes: {path: {class, visible, …}}, count}.
+    """
+    cf = urllib.parse.quote(class_filter)
+    kw = urllib.parse.quote(keyword)
+    return client.get(f"/find_nodes?class_filter={cf}&keyword={kw}")
+
+
+@mcp.tool()
+def get_ui_state() -> str:
+    """
+    Return all visible Control nodes with their current UI state, flattened.
+
+    Uses Godot's native `node is Control` check, so Button, Label, LineEdit,
+    ProgressBar, OptionButton, etc. are all included without string matching.
+    Invisible controls are excluded.
+
+    Returns {ok, nodes: {path: {class, visible, text?, value?, disabled?}}, count}.
+    Faster and cheaper than get_snapshot when you only care about the UI layer.
+    """
+    return client.get("/ui_state")
+
+
+@mcp.tool()
+def assert_node_exists(path: str) -> str:
+    """
+    Assert that a node exists at the given path in the current scene tree.
+
+    Raises RuntimeError (tool error visible to Claude) if the node is not found.
+    On success returns {ok, path, class, …all captured properties}.
+
+    Args:
+        path: snapshot-style path, e.g. "root/HUD/HealthBar"
+    """
+    encoded = urllib.parse.quote(path)
+    data = client.get_json(f"/assert_node?path={encoded}")
+    if not data.get("ok"):
+        raise RuntimeError(f"assert_node_exists failed: node not found: {path}")
+    return json.dumps(data)
+
+
+@mcp.tool()
+def assert_text(path: str, expected: str) -> str:
+    """
+    Assert that a node's text property equals the expected string.
+
+    Raises RuntimeError on mismatch:  "assert_text failed: expected 'X' but got 'Y'"
+    Raises RuntimeError if not found: "assert_text failed: node not found: <path>"
+    On success returns {ok, path, text}.
+
+    Args:
+        path:     snapshot-style path, e.g. "root/HUD/ScoreLabel"
+        expected: the exact text value expected
+    """
+    encoded_path = urllib.parse.quote(path)
+    encoded_expected = urllib.parse.quote(expected)
+    data = client.get_json(
+        f"/assert_text?path={encoded_path}&expected={encoded_expected}"
+    )
+    if not data.get("ok"):
+        error = data.get("error", "unknown error")
+        raise RuntimeError(f"assert_text failed: {error}")
+    return json.dumps(data)
+
+
+@mcp.tool()
 def wait_for_condition(
     node_path: str,
     property: str,
@@ -267,6 +350,90 @@ def capture_frame(scale: float = 0.5, quality: float = 0.75) -> list[ImageConten
             mimeType="image/jpeg",
         )
     ]
+
+
+# ---------------------------------------------------------------------------
+# Godot process lifecycle
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def start_godot(
+    project_path: str,
+    godot_executable: str = "godot",
+) -> str:
+    """
+    Launch Godot for the given project and capture the process PID.
+
+    Starts Godot with `godot --path <project_path>`. The ClaudeHarness plugin
+    must be enabled in the project for the other tools to connect.
+
+    Args:
+        project_path: absolute path to the Godot project (directory containing
+                      project.godot).
+        godot_executable: name or full path of the Godot binary (default "godot",
+                          assuming it is on PATH).
+
+    Returns {ok, pid, project_path} on success, or {ok: false, error} on failure.
+    After calling this, wait 2–3 seconds then check get_status() to confirm the
+    plugin is listening.
+    """
+    global _godot_process
+    if _godot_process is not None and _godot_process.poll() is None:
+        return json.dumps({
+            "ok": False,
+            "error": "Godot is already running",
+            "pid": _godot_process.pid,
+        })
+    exe = godot_executable or shutil.which("godot") or "godot"
+    try:
+        _godot_process = subprocess.Popen(
+            [exe, "--path", project_path, "--", "--claude-harness"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return json.dumps({
+            "ok": True,
+            "pid": _godot_process.pid,
+            "project_path": project_path,
+        })
+    except FileNotFoundError:
+        return json.dumps({"ok": False, "error": f"Godot executable not found: {exe}"})
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)})
+
+
+@mcp.tool()
+def stop_godot() -> str:
+    """
+    Stop the Godot process that was started with start_godot().
+
+    Sends SIGTERM (or platform equivalent) and waits up to 5 seconds for a
+    clean exit; sends SIGKILL if it does not exit in time.
+
+    Returns {ok, pid, stopped: true} on success.
+    Returns {ok: false, error} if no process is tracked or it has already exited.
+    """
+    global _godot_process
+    if _godot_process is None:
+        return json.dumps({
+            "ok": False,
+            "error": "No Godot process tracked. Use start_godot() first.",
+        })
+    pid = _godot_process.pid
+    if _godot_process.poll() is not None:
+        _godot_process = None
+        return json.dumps({
+            "ok": False,
+            "error": f"Godot process (pid={pid}) has already exited.",
+        })
+    try:
+        _godot_process.terminate()
+        _godot_process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        _godot_process.kill()
+    _godot_process = None
+    return json.dumps({"ok": True, "pid": pid, "stopped": True})
 
 
 # ---------------------------------------------------------------------------
