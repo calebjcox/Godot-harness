@@ -57,6 +57,43 @@ def get_status() -> str:
 
 
 @mcp.tool()
+def get_config() -> str:
+    """
+    Return current harness configuration.
+
+    Shows extra_props (additional node properties included in all snapshots),
+    port, and snap_depth. Call this to see what properties are being captured
+    before running tests.
+
+    Returns {ok, port, snap_depth, extra_props}.
+    """
+    return client.get("/config")
+
+
+@mcp.tool()
+def configure(extra_props: list[str] | None = None) -> str:
+    """
+    Update harness configuration for this session.
+
+    extra_props: additional node property names to include in ALL snapshots
+    (get_snapshot, observe_scene, find_nodes, get_diff, set_baseline).
+    Captured via node.get(prop) for any node that has the property.
+
+    Call this at the start of a test session before set_baseline().
+    Changes persist until Godot restarts. For permanent defaults, set
+    claude_harness/extra_snapshot_props in ProjectSettings (project.godot).
+
+    Common values: ["disabled", "button_pressed", "color", "modulate"]
+
+    Returns {ok, extra_props}.
+    """
+    payload: dict[str, Any] = {}
+    if extra_props is not None:
+        payload["extra_props"] = extra_props
+    return client.post("/configure", payload)
+
+
+@mcp.tool()
 def pause_game() -> str:
     """
     Pause game execution (get_tree().paused = true).
@@ -184,24 +221,34 @@ def get_snapshot(output_path: str | None = None) -> str:
 
 
 @mcp.tool()
-def find_nodes(class_filter: str = "", keyword: str = "") -> str:
+def find_nodes(
+    class_filter: str = "",
+    keyword: str = "",
+    prop_filter: str = "",
+    prop_value: str = "",
+) -> str:
     """
-    Return only the nodes that match a class name or a text/property keyword.
+    Return only the nodes that match a class name, a text keyword, or a property value.
 
-    OR logic: a node is included if it matches class_filter OR keyword (or both).
-    If neither is supplied, all nodes are returned (equivalent to the snapshot dict).
+    class_filter and keyword use OR logic between themselves.
+    prop_filter/prop_value act as an AND gate: if supplied, the node must also
+    have that property equal to that value (compared as strings).
 
     Args:
         class_filter: case-insensitive substring matched against the node's class
                       (e.g. "Button", "Label", "AnimationPlayer")
         keyword:      case-insensitive substring matched against any string property
                       value (text, current_animation, animation, placeholder_text…)
+        prop_filter:  property name to compare (e.g. "disabled", "visible")
+        prop_value:   expected value as string (e.g. "True", "false", "42")
 
     Returns {ok, nodes: {path: {class, visible, …}}, count}.
     """
     cf = urllib.parse.quote(class_filter)
     kw = urllib.parse.quote(keyword)
-    return client.get(f"/find_nodes?class_filter={cf}&keyword={kw}")
+    pf = urllib.parse.quote(prop_filter)
+    pv = urllib.parse.quote(prop_value)
+    return client.get(f"/find_nodes?class_filter={cf}&keyword={kw}&prop_filter={pf}&prop_value={pv}")
 
 
 @mcp.tool()
@@ -262,6 +309,129 @@ def assert_text(path: str, expected: str) -> str:
 
 
 @mcp.tool()
+def get_node_property(path: str, property: str) -> str:
+    """
+    Read a single named property from a specific node without fetching the full snapshot.
+
+    More efficient than get_snapshot when you only need one value.
+    Supports the "prop:subfield" notation for Vector2/3/Color components,
+    e.g. "global_position:x", "modulate:r".
+
+    Args:
+        path:     snapshot-style node path, e.g. "root/HUD/HealthBar"
+        property: property name or "prop:subfield" expression
+
+    Returns {ok, path, property, value}.
+    """
+    encoded_path = urllib.parse.quote(path)
+    encoded_prop = urllib.parse.quote(property)
+    return client.get(f"/get_node_property?path={encoded_path}&property={encoded_prop}")
+
+
+@mcp.tool()
+def get_viewport_size() -> str:
+    """
+    Return the actual game viewport dimensions.
+
+    Use this to compute click coordinates relative to node positions rather than
+    hard-coding pixel values.
+
+    Returns {ok, width, height}.
+    """
+    return client.get("/get_viewport_size")
+
+
+@mcp.tool()
+def get_node_rect(path: str) -> str:
+    """
+    Return the screen-space global rect of a Control node.
+
+    Use center_x/center_y for reliable click targeting:
+        send_input(f"click:{data['center_x']},{data['center_y']}")
+
+    Args:
+        path: snapshot-style node path, e.g. "root/HUD/StartButton"
+
+    Returns {ok, path, x, y, width, height, center_x, center_y}.
+    Returns {ok: false, error} if the node is not found or is not a Control.
+    """
+    encoded = urllib.parse.quote(path)
+    return client.get(f"/get_node_rect?path={encoded}")
+
+
+@mcp.tool()
+def get_autoload_var(autoload: str, variable: str) -> str:
+    """
+    Read a variable from a Godot autoload singleton.
+
+    Use this to inspect global game state (scores, settings, save data) without
+    scraping labels or reading files from disk.
+
+    Args:
+        autoload: the autoload name as registered in Project Settings,
+                  e.g. "GameState", "AudioManager"
+        variable: the exported or public variable name, e.g. "best_throughput"
+
+    Returns {ok, autoload, variable, value}.
+    Returns {ok: false, error} if the autoload or variable does not exist.
+    """
+    encoded_al = urllib.parse.quote(autoload)
+    encoded_var = urllib.parse.quote(variable)
+    return client.get(f"/get_autoload_var?autoload={encoded_al}&variable={encoded_var}")
+
+
+@mcp.tool()
+def assert_node_property(path: str, prop: str, expected: str) -> str:
+    """
+    Assert that a node property equals an expected value.
+
+    Raises RuntimeError on mismatch so test scripts don't need to parse JSON.
+    Values are compared as strings, so use "True"/"False" for booleans,
+    "42.0" or "42" for numbers, etc. Supports "prop:subfield" notation.
+
+    Args:
+        path:     snapshot-style node path, e.g. "root/HUD/HealthBar"
+        prop:     property name (supports "prop:subfield" notation)
+        expected: expected value as a string
+
+    Returns {ok, path, prop, expected, actual, message} on success.
+    Raises RuntimeError on mismatch.
+    """
+    encoded_path = urllib.parse.quote(path)
+    encoded_prop = urllib.parse.quote(prop)
+    encoded_expected = urllib.parse.quote(expected)
+    data = client.get_json(
+        f"/assert_property?path={encoded_path}&prop={encoded_prop}&expected={encoded_expected}"
+    )
+    if not data.get("ok"):
+        msg = data.get("message", "unknown error")
+        raise RuntimeError(f"assert_node_property failed: {msg}")
+    return json.dumps(data)
+
+
+@mcp.tool()
+def wait_for_node_visible(node_path: str, timeout_ms: int = 5000) -> str:
+    """
+    Wait until a node becomes visible in the scene tree, then auto-pause.
+
+    Shorthand for wait_for_condition(node_path, "visible", "eq", True, timeout_ms).
+    Use after triggering an action that should make a panel, dialog, or screen appear.
+
+    Args:
+        node_path:  snapshot-style path, e.g. "root/HUD/ResultsPanel"
+        timeout_ms: maximum wait in milliseconds (default 5000)
+
+    Returns same format as wait_for_condition: {ok, matched_value, elapsed_ms, diff_from_baseline}.
+    """
+    timeout = math.ceil(timeout_ms / 1000.0) + 3.0
+    return client.post(
+        "/wait_for_visible",
+        {"node_path": node_path, "timeout_ms": timeout_ms},
+        timeout=timeout,
+    )
+
+
+@mcp.tool()
 def wait_for_condition(
     node_path: str,
     property: str,
@@ -315,6 +485,7 @@ def send_input(action: str, duration_ms: int = 50) -> str:
               (check the project's InputMap for available action names)
             - A key name:  "key:Space", "key:Enter", "key:Escape", "key:A"
             - A mouse click: "click:320,240"  (pixel coordinates on the game window)
+            - A mouse hover: "hover:320,240"  (moves cursor without clicking; triggers mouse_entered)
         duration_ms: how long the key/action is held down (default 50 ms)
 
     Returns {ok, action, t_ms}.
